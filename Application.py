@@ -373,10 +373,6 @@ if __name__ == '__main__':
     "Paralelo em importação de coautores"
   ]
   
-  # averages = []
-  # responses = []
-  # times = []
-  
   print(f"Modo {modes[mode]}")
   start_time = time.time()
   response = process_lattes(id)
@@ -385,10 +381,3 @@ if __name__ == '__main__':
 
   with open(f"result_{mode}", "w") as f:
     f.write(str(elapsed_time))
-    # f.write(str(response))
-
-  # responses.append(str(response))
-  # averages.append((mode, np.array(times).mean()))
-
-  # df = pd.DataFrame(averages, columns=['Modo', 'Média'])
-  # df.to_csv('averages.csv')
