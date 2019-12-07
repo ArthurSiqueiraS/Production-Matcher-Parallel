@@ -12,6 +12,11 @@ from fuzzywuzzy import fuzz
 import sys
 import zipfile
 from multiprocessing import Pool
+from functools import partial, reduce
+import time 
+import numpy as np
+import pandas as pd
+import re
 
 def specific_fields(type):
     fields = {
@@ -36,7 +41,9 @@ def specific_fields(type):
     return fields.get('kind'), fields.get('field_type'), fields.get('country'), fields.get('homepage')
 
 def normalize_author_name(name):
-  name = name.lower()
+  name = name.lower().strip()
+  while not re.search("[\w\.]$", name):
+    name = name[:-1]
 
   if ',' in name:
     last_name = name.split(',')[0].split()[-1]
@@ -133,6 +140,11 @@ def extract_data(document, type, id_cnpq, name):
       'id_orientador': id_cnpq
     }
 
+def extract_collection(d, category, id, name):
+  data = extract_data(d, category, id, name)
+  # coauthors = [autor['id_cnpq'] for autor in data.get('lista_autores') if autor['id_cnpq']]
+  return data
+
 def import_from_xml(file, original=False):
   tree = ET.parse(file)
   root = tree.getroot()
@@ -159,22 +171,32 @@ def import_from_xml(file, original=False):
   ]
   tccs = [el for el in outra_producao if el[0].attrib.get('NATUREZA') == 'TRABALHO_DE_CONCLUSAO_DE_CURSO_GRADUACAO']
 
+  collections = [
+    ('artigo_em_evento', artigos_em_eventos),
+    ('artigo_em_periodico', artigos_em_periodicos),
+    ('tese_ou_dissertacao', orientacoes),
+    ('tcc', tccs)
+  ]
   productions = []
   coauthors = []
                        
-  for a in artigos_em_eventos:
-    data = extract_data(a, 'artigo_em_evento', id, name)
-    coauthors += [autor['id_cnpq'] for autor in data.get('lista_autores') if autor['id_cnpq']]
-    productions.append(data)
-
-  for a in artigos_em_periodicos:
-    data = extract_data(a, 'artigo_em_periodico', id, name)
-    coauthors += [autor['id_cnpq'] for autor in data.get('lista_autores') if autor['id_cnpq']]
-    productions.append(data)
-                       
-  productions += [extract_data(o, 'tese_ou_dissertacao', id, name) for o in orientacoes]
-  productions += [extract_data(t, 'tcc', id, name) for t in tccs]
+  for category, collection in collections:
+    if mode == 3:
+      with Pool(nprocesses) as p:
+        results = p.map(partial(extract_collection, category=category, id=id, name=name), collection)  
+        coauthors += [autor['id_cnpq'] for data in results for autor in data.get('lista_autores') if autor['id_cnpq']]
+        productions += results
+    else:
+      for d in collection:
+        data = extract_data(d, category, id, name)
+        coauthors += [autor['id_cnpq'] for autor in data.get('lista_autores') if autor['id_cnpq']]
+        productions.append(data)
     
+  while len(coauthors) > 20:
+    coauthors.pop()
+
+  coauthors.sort()
+                         
   return productions, set(coauthors) - {id}
 
 def create_folder(id):
@@ -208,13 +230,28 @@ def download_xml(id, folder):
     
     return False
 
+def importar(id, coauthors, productions, folder):
+  if download_xml(id, folder):
+    new_productions, new_coauthors = import_from_xml(f"{folder}{id}.xml")
+
+    return new_productions, new_coauthors
+  
+  return [], set()
+
 def import_coauthors(coauthors, productions, folder):
-    for id in coauthors:
+    if mode == 4:
+      with Pool(nprocesses) as p:
+        results = p.map(partial(importar, coauthors=coauthors, productions=productions, folder=folder), coauthors)
+        productions += [data for r in results for data in r[0]]
+        coauthors = reduce(lambda s1, s2: s1.union(s2), [r[1] for r in results])
+
+    else: 
+      for id in coauthors:
         if download_xml(id, folder):
-            new_productions, new_coauthors = import_from_xml(f"{folder}{id}.xml")
-            productions += new_productions
-            coauthors = coauthors.union(new_coauthors)
-            
+          new_productions, new_coauthors = import_from_xml(f"{folder}{id}.xml")
+          productions += new_productions
+          coauthors = coauthors.union(new_coauthors)
+
     return coauthors
 
 def comparable_productions(left, right, fields):
@@ -229,18 +266,32 @@ def comparable_productions(left, right, fields):
         
     return False
 
-def f(left):
+def compare(right, left):
+  if comparable_productions(left, right, fields):
+    features = torch.FloatTensor(mlp.get_features(left, right))
+    result = model(features)
+    if result[0] < result[1]:
+      return {
+        'info': right,
+        'different_fields': [field for field in fields if left[field] != right[field]]
+      }
+    
+  return None
+
+def compare_production(left):
     equal = 0
     matches = []
-    for right in productions:
-        if comparable_productions(left, right, fields):
-          features = torch.FloatTensor(mlp.get_features(left, right))
-          result = model(features)
-          if result[0] < result[1]:
-              matches.append({
-                  'info': right, 
-                  'different_fields': [field for field in fields if left[field] != right[field]]
-              })
+    
+    if mode == 2:
+      with Pool(nprocesses) as p:
+        matches = p.map(partial(compare, left=left), productions)
+        matches = [match for match in matches if match]
+
+    else:
+      for right in productions:
+        match = compare(right, left)
+        if match:
+          matches.append(match)
 
     if len(matches) > 0:
         category = categoryNames[categories.index(left['subcategoria'])]
@@ -252,8 +303,9 @@ def f(left):
 
     return (None, None)
 
-def process_lattes(id, nprocesses=4):
+def process_lattes(id):
   global productions, categories, categoryNames, fields, model
+  
   categories = ['artigo_em_evento', 'artigo_em_periodico', 'tese_ou_dissertacao', 'tcc']
   categoryNames = ['Artigos em Eventos', 'Artigos em Periódicos', 'Orientações de Mestrado e Doutorado', 'Orientações de TCC']
 
@@ -270,15 +322,21 @@ def process_lattes(id, nprocesses=4):
       "origem": {
         "nome": original_productions[0].get('nome_origem'),
         "id": id 
-      }
+      }, 
+      categoryNames[0]: [],
+      categoryNames[1]: [],
+      categoryNames[2]: [],
+      categoryNames[3]: []
   }
 
   # 1 Nivel de coautoria
   coauthors = import_coauthors(coauthors, productions, folder) - coauthors
+  # print([coauthor for coauthor in coauthors if not os.path.exists(f"curriculos/{coauthor}.zip")])
   # 2 Niveis de coautoria
   import_coauthors(coauthors, productions, folder)
 
   delete_folder(id)
+  print(f"Número de produções: {len(productions)}")
 
   model = mlp.MLP()
   model.load_state_dict(torch.load('./production_matcher', map_location=torch.device('cpu')))
@@ -287,17 +345,50 @@ def process_lattes(id, nprocesses=4):
   exception_fields = ['lattes_origem', 'nome_origem', 'titulo_normalizado_1', 'titulo_normalizado_2']
   fields = [key for key in original_productions[0].keys() if key not in exception_fields]
 
-  with Pool(nprocesses) as p:
-    productions = p.map(f, original_productions)
-    for category in categoryNames:
-      categoryProductions = filter(lambda p: p[0] == category, productions)
-      response[category] = list(map(lambda p: p[1], categoryProductions))
-  
-  print(response)
-  # for left in original_productions:
-      
+  if mode == 1:
+    with Pool(nprocesses) as p:
+      productions = p.map(compare_production, original_productions)
+      for category in categoryNames:
+        categoryProductions = filter(lambda p: p[0] == category, productions)
+        response[category] = list(map(lambda p: p[1], categoryProductions))
+
+  else:
+    for left in original_productions:
+        category, result = compare_production(left)
+        if category:
+          response[category].append(result)
 
   return response
 
 if __name__ == '__main__':
-    print(process_lattes(sys.argv[1]))
+  id = sys.argv[1]
+  mode = int(sys.argv[2])
+  nprocesses = int(sys.argv[3])
+  
+  modes = [
+    "Serial",
+    "Paralelo em loop de comparação externo",
+    "Paralelo em loop de comparação interno",
+    "Paralelo em importação de xml",
+    "Paralelo em importação de coautores"
+  ]
+  
+  # averages = []
+  # responses = []
+  # times = []
+  
+  print(f"Modo {modes[mode]}")
+  start_time = time.time()
+  response = process_lattes(id)
+  elapsed_time = time.time() - start_time
+  print(elapsed_time)
+
+  with open(f"result_{mode}", "w") as f:
+    f.write(str(elapsed_time))
+    # f.write(str(response))
+
+  # responses.append(str(response))
+  # averages.append((mode, np.array(times).mean()))
+
+  # df = pd.DataFrame(averages, columns=['Modo', 'Média'])
+  # df.to_csv('averages.csv')

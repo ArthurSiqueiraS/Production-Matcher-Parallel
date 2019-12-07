@@ -35,7 +35,9 @@ def specific_fields(type):
     return fields.get('kind'), fields.get('field_type'), fields.get('country'), fields.get('homepage')
 
 def normalize_author_name(name):
-  name = name.lower()
+  name = name.lower().strip()
+  while not re.match("[\w\.]$", name):
+    name = name[:-1]
 
   if ',' in name:
     last_name = name.split(',')[0].split()[-1]
