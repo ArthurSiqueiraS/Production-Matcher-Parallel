@@ -2,12 +2,12 @@
 # coding: utf-8
 
 import xml.etree.ElementTree as ET
-from normalization import Normalizer
+from modules.normalization import Normalizer
 import os
 import shutil
 import torch
 import torch.nn as nn
-import mlp
+import modules.mlp as mlp
 from fuzzywuzzy import fuzz
 import sys
 import zipfile
